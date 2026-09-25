@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -73,7 +74,51 @@ struct Config {
     static constexpr size_t kReadBufferBytes = 1u * 1024 * 1024;
     static constexpr size_t kMaxLineBytes = 16u * 1024 * 1024;
     static constexpr size_t kBucketIoBufferBytes = 64u * 1024;
+
+    // Верхние границы для пользовательских CLI-параметров: без них
+    // --buckets=<огромное число> или --top=<огромное число> сами по себе
+    // могут нарушить гарантию RAM<128МБ (буферы записи и reserve()
+    // растут прямо пропорционально этим значениям).
+    static constexpr long long kMaxBucketCountArg = 512;   // 512 x 64КБ = 32 МБ буферов записи
+    static constexpr long long kMaxTopKArg = 10000;
 };
+
+static_assert(Config::kMaxTraceIdLength <= 255,
+              "traceIdLength в BucketRecord — uint8_t; длина traceId не может превышать 255");
+
+// ==========================================================================
+// Обработка прерывания (SIGINT/SIGTERM)
+// ==========================================================================
+
+// POSIX-сигнал может прийти в любой момент много-минутного прогона на
+// 10 ГБ входе; без обработки процесс завершится немедленно, минуя
+// деструктор TempWorkspace, и оставит временные файлы на диске — тот же
+// класс проблемы, из-за которого этот код не пользуется std::exit()
+// нигде в собственной логике, но здесь источник прерывания внешний и
+// неподконтрольный.
+//
+// Обработчик сигнала обязан быть async-signal-safe: единственное, что
+// ему разрешено, — записать в volatile sig_atomic_t. Это единственная
+// переменная в программе с нелокальным временем жизни: сама сигнатура
+// API сигналов (голый указатель на функцию без пользовательского
+// контекста) не оставляет другого способа передать событие из
+// обработчика в обычный код.
+volatile std::sig_atomic_t g_receivedSignal = 0;
+
+void handle_termination_signal(int signalNumber) noexcept {
+    g_receivedSignal = signalNumber;
+}
+
+// Проверяется в редких точках горячих циклов (раз на ~1 МиБ входа при
+// чтении, раз на бакет при свода) — этого достаточно для отклика в
+// пределах доли секунды на входах гигабайтного размера, не усложняя
+// сами циклы веткой на каждую запись.
+void throw_if_interrupted() {
+    if (g_receivedSignal != 0) {
+        throw LogTopError("interrupted by signal " + std::to_string(g_receivedSignal) +
+                           ", cleaning up temporary files", 128 + g_receivedSignal);
+    }
+}
 
 // ==========================================================================
 // Разбор timestamp: "YYYY-MM-DDTHH:MM:SS.mmmZ" -> миллисекунды от эпохи
