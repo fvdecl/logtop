@@ -1,6 +1,7 @@
 * text=auto eol=lf
 
 *.sh text eol=lf
-Makefile text eol=lf
-main.cpp text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.txt text eol=lf
 tests/fixtures/* text eol=lf
