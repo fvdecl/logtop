@@ -16,6 +16,11 @@ if [[ ! -x "$BINARY" ]]; then
     make -C "$PROJECT_DIR" >&2 || { echo "run_tests.sh: сборка не удалась" >&2; exit 1; }
 fi
 
+# Все прогоны идут через logtop. LOGTOP_EXTRA_ARGS позволяет прогнать весь набор
+# с дополнительными флагами, например --max-open-requests=1 — тогда каждое
+# сценарие проверяет путь с переносом на диск.
+logtop() { "$BINARY" ${LOGTOP_EXTRA_ARGS:-} "$@"; }
+
 # Прогоняет $BINARY на $input (через stdin) и сравнивает stdout с
 # $expected. По умолчанию сравнение точное и позиционное (программа
 # обязана сортировать по убыванию длительности). Передайте UNORDERED=1
@@ -25,7 +30,7 @@ fi
 run_case() {
     local name="$1" input="$2" expected="$3"
     local actual
-    actual="$(printf '%s' "$input" | "$BINARY" 2>/dev/null)"
+    actual="$(printf '%s' "$input" | logtop 2>/dev/null)"
 
     local ok=1
     if [[ "${UNORDERED:-0}" == "1" ]]; then
@@ -53,7 +58,7 @@ run_case() {
 assert_contains_line() {
     local name="$1" input="$2" expectedLine="$3"
     local actual
-    actual="$(printf '%s' "$input" | "$BINARY" 2>/dev/null)"
+    actual="$(printf '%s' "$input" | logtop 2>/dev/null)"
 
     if grep -qxF "$expectedLine" <<<"$actual"; then
         echo "PASS: $name"
@@ -227,6 +232,18 @@ not-a-timestamp-at-all badts2 Request started x
 2025-01-01T00:00:01.000Z ok1 Request completed x" \
 "ok1 1000"
 
+# Длительность через 29 февраля високосного года (2 суток без 1 мс с обеих сторон).
+run_case "12b: длительность через 29 февраля високосного года" \
+"2024-02-28T23:59:59.999Z leap Request started x
+2024-03-01T00:00:00.001Z leap Request completed x" \
+"leap 86400002"
+
+# Невозможная дата (30 февраля) отбрасывает строку: запрос без старта не попадает в вывод.
+run_case "12c: 30 февраля не принимается за валидную дату" \
+"2025-02-30T00:00:00.000Z impossible Request started x
+2025-03-02T00:00:00.000Z impossible Request completed x" \
+""
+
 # --------------------------------------------------------------------
 # 13. Пустая строка не ломает разбор соседних строк
 # --------------------------------------------------------------------
@@ -267,6 +284,160 @@ run_case "15b: MESSAGE длиннее жёсткого предела строк
 "$oversized_input" \
 "ok2 4000"
 
+# Слишком длинная строка отбрасывается целиком и учитывается как malformed.
+stats_line="$(printf '%s' "$oversized_input" | logtop 2>&1 >/dev/null | grep -o 'malformed=[0-9]*')"
+if [[ "$stats_line" == "malformed=1" ]]; then
+    echo "PASS: 15c: слишком длинная строка учитывается как malformed"
+    pass=$((pass + 1))
+else
+    echo "FAIL: 15c: ожидалось malformed=1, получено '$stats_line'"
+    fail=$((fail + 1))
+fi
+
+# --------------------------------------------------------------------
+# Чтение входа: пустой файл, последняя строка без '\n' и с ним, пустые
+# строки в середине, ошибки ввода-вывода.
+# --------------------------------------------------------------------
+actual="$(logtop < /dev/null 2>/dev/null)"
+code=$?
+if [[ -z "$actual" && $code -eq 0 ]]; then
+    echo "PASS: R1: пустой вход — пустой результат, код 0"
+    pass=$((pass + 1))
+else
+    echo "FAIL: R1: пустой вход (код $code, вывод '$actual')"
+    fail=$((fail + 1))
+fi
+
+run_case "R2: последняя строка с переводом строки" \
+"$(printf '2025-01-01T00:00:00.000Z nl Request started x\n2025-01-01T00:00:02.000Z nl Request completed x\n')" \
+"nl 2000"
+
+run_case "R3: последняя строка без переводов строки" \
+"$(printf '2025-01-01T00:00:00.000Z nn Request started x\n2025-01-01T00:00:02.000Z nn Request completed x')" \
+"nn 2000"
+
+run_case "R4: пустые строки между записями" \
+"$(printf '\n\n2025-01-01T00:00:00.000Z e Request started x\n\n2025-01-01T00:00:02.000Z e Request completed x\n\n')" \
+"e 2000"
+
+expect_error_exit() {
+    local name="$1" expectedCode="$2" stderrPattern="$3"
+    shift 3
+    local stderrText code
+    stderrText="$("$@" 2>&1 >/dev/null)"
+    code=$?
+    if [[ $code -eq $expectedCode ]] && grep -q "$stderrPattern" <<<"$stderrText"; then
+        echo "PASS: $name"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $name (код $code, stderr: '$stderrText')"
+        fail=$((fail + 1))
+    fi
+}
+
+expect_error_exit "R5: закрытый stdin — ошибка чтения, код 2" 2 "failed to read stdin" \
+    bash -c "exec 0<&-; '$BINARY'"
+expect_error_exit "R6: stdin — каталог, ошибка чтения, код 2" 2 "failed to read stdin" \
+    bash -c "'$BINARY' < /"
+
+# --------------------------------------------------------------------
+# Жизненный цикл открытых запросов: повторное начало, завершение без начала,
+# некорректный timestamp, завершение раньше начала, равные длительности.
+# --------------------------------------------------------------------
+run_case "L1: повторный запрос с тем же traceId после завершения — новый запрос" \
+"2025-01-01T00:00:00.000Z x Request started a
+2025-01-01T00:00:01.000Z x Request completed a
+2025-01-01T00:00:02.000Z x Request started b
+2025-01-01T00:00:07.000Z x Request completed b" \
+"x 5000
+x 1000"
+
+run_case "L2: нулевая длительность (старт и завершение в одну миллисекунду)" \
+"2025-01-01T00:00:00.123Z z Request started a
+2025-01-01T00:00:00.123Z z Request completed a" \
+"z 0"
+
+run_case "L3: завершение с некорректным timestamp не закрывает запрос" \
+"2025-01-01T00:00:00.000Z y Request started a
+2025-01-01T00:00:05.00Z y Request completed a" \
+""
+
+run_case "L4: некорректный timestamp старта — запрос не открывается" \
+"2025-01-01T00:00:00.00Z y Request started a
+2025-01-01T00:00:05.000Z y Request completed a" \
+""
+
+run_case "L5: завершение раньше начала — запрос закрывается без результата" \
+"2025-01-01T00:00:05.000Z q Request started a
+2025-01-01T00:00:01.000Z q Request completed a
+2025-01-01T00:00:09.000Z q Request completed b" \
+""
+
+run_case "L6: равные длительности на границе топ-5 — выигрывает меньший traceId" \
+"2025-01-01T00:00:00.000Z bb Request started x
+2025-01-01T00:00:05.000Z bb Request completed x
+2025-01-01T00:00:00.000Z aa Request started x
+2025-01-01T00:00:05.000Z aa Request completed x
+2025-01-01T00:00:00.000Z t1 Request started x
+2025-01-01T00:00:09.000Z t1 Request completed x
+2025-01-01T00:00:00.000Z t2 Request started x
+2025-01-01T00:00:08.000Z t2 Request completed x
+2025-01-01T00:00:00.000Z t3 Request started x
+2025-01-01T00:00:07.000Z t3 Request completed x
+2025-01-01T00:00:00.000Z t4 Request started x
+2025-01-01T00:00:06.000Z t4 Request completed x" \
+"t1 9000
+t2 8000
+t3 7000
+t4 6000
+aa 5000"
+
+# Счётчик незавершённых/лишних событий в служебной строке stderr.
+stats_check="$(printf '%s' "2025-01-01T00:00:00.000Z s Request completed x" | logtop 2>&1 >/dev/null)"
+if grep -q "unmatched_finishes=1" <<<"$stats_check"; then
+    echo "PASS: L7: завершение без начала учитывается в статистике"
+    pass=$((pass + 1))
+else
+    echo "FAIL: L7: ожидалось unmatched_finishes=1, stderr: '$stats_check'"
+    fail=$((fail + 1))
+fi
+
+# Минимальное значение --max-open-requests зажимается до 1 и не ломает результат.
+actual="$(printf '%s' "2025-01-01T00:00:00.000Z abc Request started x
+2025-01-01T00:00:05.500Z abc Request completed x" | "$BINARY" --max-open-requests=0 2>/dev/null)"
+if [[ "$actual" == "abc 5500" ]]; then
+    echo "PASS: L8: --max-open-requests=0 зажимается до 1"
+    pass=$((pass + 1))
+else
+    echo "FAIL: L8: --max-open-requests=0 (вывод '$actual')"
+    fail=$((fail + 1))
+fi
+
+# Временные файлы: после прогона каталог TMPDIR должен быть пуст. Проверяем оба
+# режима независимо от LOGTOP_EXTRA_ARGS: без переполнения временных файлов нет,
+# с переполнением они удаляются.
+temp_check() {
+    local name="$1"; shift
+    local dir
+    dir="$(mktemp -d)"
+    (
+        export TMPDIR="$dir"
+        printf '%s' "2025-01-01T00:00:00.000Z t Request started x
+2025-01-01T00:00:01.000Z t Request completed x
+2025-01-01T00:00:00.000Z u Request started x" | "$BINARY" "$@" >/dev/null 2>&1
+    )
+    if [[ -z "$(ls -A "$dir")" ]]; then
+        echo "PASS: $name"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $name (остались файлы: $(ls -A "$dir"))"
+        fail=$((fail + 1))
+    fi
+    rm -rf "$dir"
+}
+temp_check "T1: без переполнения временных файлов не создаётся"
+temp_check "T2: при переполнении временные файлы удаляются" --max-open-requests=1
+
 # --------------------------------------------------------------------
 # 16. Большое количество traceId (несколько миллионов уникальных,
 # подавляющее большинство никогда не завершается) — программа не
@@ -277,7 +448,7 @@ bigCardinalityLog="$(mktemp)"
 bigCardinalityExpected="$(mktemp)"
 "$SCRIPT_DIR/generate_log.sh" --lines 2000000 --expected-output "$bigCardinalityExpected" > "$bigCardinalityLog"
 
-actual="$("$BINARY" < "$bigCardinalityLog" 2>/dev/null)"
+actual="$(logtop < "$bigCardinalityLog" 2>/dev/null)"
 if diff <(sort "$bigCardinalityExpected") <(sort <<<"$actual") >/dev/null; then
     echo "PASS: 16: большое количество traceId"
     pass=$((pass + 1))
@@ -292,7 +463,7 @@ rm -f "$bigCardinalityLog" "$bigCardinalityExpected"
 # --------------------------------------------------------------------
 # 18. Результат на заранее известном наборе данных (фикстура)
 # --------------------------------------------------------------------
-actual="$("$BINARY" < "$SCRIPT_DIR/fixtures/known_dataset.log" 2>/dev/null)"
+actual="$(logtop < "$SCRIPT_DIR/fixtures/known_dataset.log" 2>/dev/null)"
 expected="$(cat "$SCRIPT_DIR/fixtures/known_dataset.expected")"
 if [[ "$actual" == "$expected" ]]; then
     echo "PASS: 18: результат на заранее известном наборе данных"

@@ -1,39 +1,43 @@
 // logtop — находит до 5 traceId с максимальной продолжительностью запроса
-// в потоковом текстовом логе произвольного размера, при жёстком контроле
-// памяти: RAM не зависит от размера входа и от числа уникальных traceId.
+// в потоковом текстовом логе произвольного размера.
 //
 // Формат строки лога:
 //   <TIMESTAMP> <TRACE_ID> <EVENT> <MESSAGE...>
 // Продолжительность = timestamp(Request completed|Request failed)
 //                    - timestamp(Request started)
 //
-// Архитектура (детали — в комментариях у соответствующих классов):
-// один потоковый проход по stdin раскладывает релевантные записи по
-// хешу traceId во временные бинарные файлы фиксированного размера
-// записи ("бакеты"). Каждый бакет обрабатывается по очереди; если он
-// всё ещё велик, он рекурсивно дробится дальше на более мелкие бакеты
-// (grace hash partitioning), пока не станет заведомо безопасного
-// размера. В памяти в любой момент времени живо состояние только
-// ОДНОГО бакета, а не всего входного файла — это и ограничивает пик
-// RAM независимо от размера входа.
+// Режимы работы:
+//  - обычный: незавершённые запросы держатся в памяти в RequestTracker, длительность
+//    вычисляется при завершении, топ-5 обновляется онлайн. Временных файлов нет.
+//  - переполнение: если открытых запросов больше maxOpenRequests, все открытые
+//    запросы и все последующие события переносятся во временные бакеты по хешу
+//    traceId; бакеты затем сводятся по одному (grace hash partitioning). Это
+//    единственный путь, где используется диск, и он нужен, чтобы не нарушать
+//    лимит памяти при произвольном числе незавершённых запросов.
 
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include <unistd.h>
+#include <stdio.h>  // getc_unlocked (POSIX) не объявлен в <cstdio>
+#include <unistd.h> // getpid
 
 namespace logtop {
 
@@ -43,15 +47,13 @@ namespace fs = std::filesystem;
 // Ошибки
 // ==========================================================================
 
-// Фатальная ошибка окружения (диск, права, оборванный stdin) — в отличие
-// от повреждённой строки лога, которая не является поводом останавливать
-// обработку многогигабайтного файла. Бросается только из редких,
-// не-горячих путей: создание/запись временных файлов, чтение stdin.
-// Построчный парсинг такие исключения не использует и не перехватывает.
+// Фатальная ошибка окружения (диск, права, оборванный stdin). Повреждённая
+// строка лога поводом для остановки не является. Бросается только из редких
+// путей; построчный разбор исключений не использует.
 class LogTopError : public std::runtime_error {
 public:
-    LogTopError(std::string message, int exitCode)
-        : std::runtime_error(std::move(message)), exitCode_(exitCode) {}
+    LogTopError(const std::string& message, int exitCode)
+        : std::runtime_error(message), exitCode_(exitCode) {}
 
     int exit_code() const noexcept { return exitCode_; }
 
@@ -65,22 +67,24 @@ private:
 
 struct Config {
     size_t topK = 5;
-    size_t bucketCount = 128;                 // фан-аут первого уровня партиционирования
+    // Память на один открытый запрос: ключ (до 128 байт в куче) + узел и бакет хеш-таблицы
+    // — до ~224 байт. 131072 запросов дают до ~30 МБ, это укладывается в лимит 128 МБ
+    // вместе с буфером строки (16 МБ) и буферами записи бакетов (8 МБ).
+    size_t maxOpenRequests = 131072;
+    size_t bucketCount = 128;                 // фан-аут первого уровня при переполнении
     size_t repartitionFanout = 16;            // фан-аут при дроблении перекошенного бакета
-    size_t maxBucketBytes = 4u * 1024 * 1024; // порог "сырых" байт бакета до дробления
-    int maxRepartitionDepth = 6;              // предохранитель от бесконечной рекурсии
+    size_t maxBucketBytes = size_t{4} * 1024 * 1024; // порог размера бакета до дробления
+    int maxRepartitionDepth = 6;                     // предохранитель от бесконечной рекурсии
 
     static constexpr size_t kMaxTraceIdLength = 128;
-    static constexpr size_t kReadBufferBytes = 1u * 1024 * 1024;
-    static constexpr size_t kMaxLineBytes = 16u * 1024 * 1024;
-    static constexpr size_t kBucketIoBufferBytes = 64u * 1024;
+    static constexpr size_t kMaxLineBytes = size_t{16} * 1024 * 1024;
+    static constexpr size_t kBucketIoBufferBytes = size_t{64} * 1024;
 
-    // Верхние границы для пользовательских CLI-параметров: без них
-    // --buckets=<огромное число> или --top=<огромное число> сами по себе
-    // могут нарушить гарантию RAM<128МБ (буферы записи и reserve()
-    // растут прямо пропорционально этим значениям).
-    static constexpr long long kMaxBucketCountArg = 512;   // 512 x 64КБ = 32 МБ буферов записи
+    // Верхние границы CLI-параметров: без них пользовательский флаг сам по себе
+    // может нарушить лимит памяти.
+    static constexpr long long kMaxBucketCountArg = 512;      // 512 x 64 КБ буферов записи
     static constexpr long long kMaxTopKArg = 10000;
+    static constexpr long long kMaxOpenRequestsArg = 262144;  // ~59 МБ при худшей длине ключа
 };
 
 static_assert(Config::kMaxTraceIdLength <= 255,
@@ -90,29 +94,14 @@ static_assert(Config::kMaxTraceIdLength <= 255,
 // Обработка прерывания (SIGINT/SIGTERM)
 // ==========================================================================
 
-// POSIX-сигнал может прийти в любой момент много-минутного прогона на
-// 10 ГБ входе; без обработки процесс завершится немедленно, минуя
-// деструктор TempWorkspace, и оставит временные файлы на диске — тот же
-// класс проблемы, из-за которого этот код не пользуется std::exit()
-// нигде в собственной логике, но здесь источник прерывания внешний и
-// неподконтрольный.
-//
-// Обработчик сигнала обязан быть async-signal-safe: единственное, что
-// ему разрешено, — записать в volatile sig_atomic_t. Это единственная
-// переменная в программе с нелокальным временем жизни: сама сигнатура
-// API сигналов (голый указатель на функцию без пользовательского
-// контекста) не оставляет другого способа передать событие из
-// обработчика в обычный код.
+// Обработчик сигнала может только записать в volatile sig_atomic_t; проверка
+// выполняется в обычном коде, и исключение размотает стек через деструкторы.
 volatile std::sig_atomic_t g_receivedSignal = 0;
 
 void handle_termination_signal(int signalNumber) noexcept {
     g_receivedSignal = signalNumber;
 }
 
-// Проверяется в редких точках горячих циклов (раз на ~1 МиБ входа при
-// чтении, раз на бакет при свода) — этого достаточно для отклика в
-// пределах доли секунды на входах гигабайтного размера, не усложняя
-// сами циклы веткой на каждую запись.
 void throw_if_interrupted() {
     if (g_receivedSignal != 0) {
         throw LogTopError("interrupted by signal " + std::to_string(g_receivedSignal) +
@@ -126,22 +115,10 @@ void throw_if_interrupted() {
 
 namespace time_parsing {
 
-// days_from_civil (Howard Hinnant) — проверенный алгоритм перевода
-// григорианской даты в число дней от 1970-01-01, без обращения к
-// системным calendar API и без аллокаций.
-constexpr int64_t days_from_civil(int64_t year, unsigned month, unsigned day) noexcept {
-    year -= month <= 2;
-    const int64_t era = (year >= 0 ? year : year - 399) / 400;
-    const unsigned yearOfEra = static_cast<unsigned>(year - era * 400);
-    const unsigned dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-    const unsigned dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
-    return era * 146097 + static_cast<int64_t>(dayOfEra) - 719468;
-}
-
-bool parse_fixed_digits(std::string_view text, size_t offset, int width, int& value) noexcept {
+bool parse_fixed_digits(std::string_view text, size_t offset, size_t width, int& value) noexcept {
     if (offset + width > text.size()) return false;
     int result = 0;
-    for (int i = 0; i < width; ++i) {
+    for (size_t i = 0; i < width; ++i) {
         const char c = text[offset + i];
         if (c < '0' || c > '9') return false;
         result = result * 10 + (c - '0');
@@ -152,10 +129,9 @@ bool parse_fixed_digits(std::string_view text, size_t offset, int width, int& va
 
 } // namespace time_parsing
 
-// Ожидается ровно 24 символа: "YYYY-MM-DDTHH:MM:SS.mmmZ". Любое отклонение
-// (другая длина, не те разделители, нецифровые символы, значения вне
-// диапазона) -> nullopt. Без исключений и без аллокаций — это часть
-// горячего цикла парсинга.
+// Строго "YYYY-MM-DDTHH:MM:SS.mmmZ" (24 символа, миллисекунды обязательны,
+// суффикс Z = UTC). Смещения и строчное "z" не поддерживаются.
+// Год — четыре цифры, поэтому результат далеко от предела int64_t.
 std::optional<int64_t> parse_iso8601_utc_millis(std::string_view text) noexcept {
     using namespace time_parsing;
 
@@ -165,7 +141,13 @@ std::optional<int64_t> parse_iso8601_utc_millis(std::string_view text) noexcept 
         return std::nullopt;
     }
 
-    int year, month, day, hour, minute, second, millis;
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    int millis = 0;
     if (!parse_fixed_digits(text, 0, 4, year)) return std::nullopt;
     if (!parse_fixed_digits(text, 5, 2, month)) return std::nullopt;
     if (!parse_fixed_digits(text, 8, 2, day)) return std::nullopt;
@@ -174,18 +156,23 @@ std::optional<int64_t> parse_iso8601_utc_millis(std::string_view text) noexcept 
     if (!parse_fixed_digits(text, 17, 2, second)) return std::nullopt;
     if (!parse_fixed_digits(text, 20, 3, millis)) return std::nullopt;
 
-    if (month < 1 || month > 12 || day < 1 || day > 31 ||
-        hour > 23 || minute > 59 || second > 59) {
-        return std::nullopt;
-    }
+    if (hour > 23 || minute > 59 || second > 59) return std::nullopt;
 
-    const int64_t days = time_parsing::days_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
+    // ok() отклоняет месяц вне 1..12, день вне диапазона месяца и 29 февраля
+    // не високосного года.
+    const std::chrono::year_month_day date{
+        std::chrono::year{year},
+        std::chrono::month{static_cast<unsigned>(month)},
+        std::chrono::day{static_cast<unsigned>(day)}};
+    if (!date.ok()) return std::nullopt;
+
+    const int64_t days = std::chrono::sys_days{date}.time_since_epoch().count();
     const int64_t secondsOfDay = hour * 3600LL + minute * 60LL + second;
     return days * 86'400'000LL + secondsOfDay * 1000LL + millis;
 }
 
 // ==========================================================================
-// Разбор строки лога: timestamp / traceId / event / message
+// Разбор строки лога: timestamp / traceId / тип события
 // ==========================================================================
 
 enum class EventKind { Started, Finished, Irrelevant };
@@ -193,22 +180,13 @@ enum class EventKind { Started, Finished, Irrelevant };
 struct LogLine {
     std::string_view timestamp;
     std::string_view traceId;
-    std::string_view event;
-    std::string_view message; // не сохраняется дальше — см. BucketRecord
     EventKind kind;
 };
 
-// EVENT в данном формате лога всегда состоит из двух слов ("Request
-// started", "Request completed", "Request failed", "DB query" — все
-// примеры в спецификации двухсловные; текст задания при этом называет
-// EVENT "строкой без пробелов", что противоречит примерам). Разночтение
-// снимается так: граница EVENT/MESSAGE — фиксированно третье и четвёртое
-// слово строки, всё остальное — MESSAGE. Для нашей задачи это не влияет
-// на корректность результата: нерелевантные события (например "DB
-// query") в любом случае отбрасываются, независимо от того, как именно
-// была бы проведена граница внутри них.
+// EVENT в этом формате — два слова ("Request started", "Request completed",
+// "Request failed", "DB query"). Граница EVENT — третье и четвёртое слово;
+// остальное — MESSAGE, которое результату не нужно и не разбирается.
 std::optional<LogLine> split_log_line(std::string_view line) noexcept {
-    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
     if (line.empty()) return std::nullopt;
 
     const size_t afterTimestamp = line.find(' ');
@@ -225,124 +203,233 @@ std::optional<LogLine> split_log_line(std::string_view line) noexcept {
 
     const size_t firstWordEnd = afterTrace.find(' ');
     if (firstWordEnd == std::string_view::npos) {
-        // Одно слово после traceId: для нашего набора событий (все
-        // двухсловные) это заведомо нерелевантная строка.
-        return LogLine{timestamp, traceId, afterTrace, {}, EventKind::Irrelevant};
+        return LogLine{timestamp, traceId, EventKind::Irrelevant};
     }
 
     const size_t secondWordEnd = afterTrace.find(' ', firstWordEnd + 1);
     const size_t eventEnd = (secondWordEnd == std::string_view::npos) ? afterTrace.size() : secondWordEnd;
     const std::string_view event = afterTrace.substr(0, eventEnd);
-    const std::string_view message =
-        (secondWordEnd == std::string_view::npos) ? std::string_view{} : afterTrace.substr(secondWordEnd + 1);
 
     EventKind kind = EventKind::Irrelevant;
     if (event == "Request started") kind = EventKind::Started;
     else if (event == "Request completed" || event == "Request failed") kind = EventKind::Finished;
 
-    return LogLine{timestamp, traceId, event, message, kind};
+    return LogLine{timestamp, traceId, kind};
 }
 
 // ==========================================================================
-// Потоковое построчное чтение файлового дескриптора (stdin)
+// Чтение stdin построчно
 // ==========================================================================
 
-// Хранит только "хвост" непрочитанных байт плюс один буфер чтения
-// ограниченного размера — никогда не буферизует входной поток целиком.
-// Аномально длинная строка (без '\n' дольше kMaxLineBytes) не растит
-// буфер бесконечно, а принудительно "разрезается"; парсер ниже по стеку
-// такой фрагмент всё равно отбракует как некорректную строку.
-class LineReader {
-public:
-    LineReader(int inputFd, size_t initialBufferBytes, size_t maxLineBytes)
-        : inputFd_(inputFd), maxLineBytes_(maxLineBytes), buffer_(initialBufferBytes) {}
+// std::getline растит строку без предела (строка 200 МБ без '\n' убивала процесс
+// под cgroup 128 МБ). Здесь строка длиннее maxBytes отбрасывается: накапливается
+// только флаг.
+enum class LineStatus { Line, TooLong, EndOfInput };
 
-    // Возвращает view на следующую строку (без \n и \r), валиден до
-    // следующего вызова next(). false — конец потока.
-    bool next(std::string_view& outLine) {
-        for (;;) {
-            if (const auto newlineOffset = find_newline()) {
-                outLine = consume_up_to(*newlineOffset, /*skipDelimiter=*/true);
-                return true;
-            }
-            if (unread_bytes() >= maxLineBytes_) {
-                outLine = consume_up_to(dataEnd_, /*skipDelimiter=*/false);
-                return true;
-            }
-            if (!refill()) {
-                if (unread_bytes() > 0) {
-                    outLine = consume_up_to(dataEnd_, /*skipDelimiter=*/false);
-                    return true;
+// Строка без '\n' на конце входа — обычная строка. Пустая строка возвращается
+// как Line с пустым содержимым.
+LineStatus read_stdin_line(std::string& line, size_t maxBytes) {
+    throw_if_interrupted();
+    line.clear();
+    bool tooLong = false;
+    bool sawByte = false;
+
+    for (;;) {
+        const int c = ::getc_unlocked(stdin); // POSIX, только глобальное пространство имён
+        if (c == EOF) {
+            if (std::ferror(stdin) != 0) {
+                if (errno == EINTR) {
+                    std::clearerr(stdin);
+                    throw_if_interrupted();
+                    continue;
                 }
-                return false;
+                const int savedErrno = errno;
+                throw LogTopError(std::string("failed to read stdin: ") + std::strerror(savedErrno), 2);
             }
+            if (!sawByte) return LineStatus::EndOfInput;
+            return tooLong ? LineStatus::TooLong : LineStatus::Line;
         }
+
+        sawByte = true;
+        if (c == '\n') return tooLong ? LineStatus::TooLong : LineStatus::Line;
+        if (tooLong) continue;
+        if (line.size() == maxBytes) {
+            tooLong = true;
+            line.clear();
+            continue;
+        }
+        line.push_back(static_cast<char>(c));
+    }
+}
+
+// ==========================================================================
+// Событие запроса и статистика
+// ==========================================================================
+
+struct RequestEvent {
+    std::string_view traceId;     // указывает в буфер строки: копируется при сохранении
+    int64_t timestampMillis;
+    bool finished;                // true = Request completed/failed, false = Request started
+};
+
+struct IngestStats {
+    uint64_t linesRead = 0;
+    uint64_t linesMalformed = 0;      // повреждённая строка, некорректный timestamp/traceId
+    uint64_t linesRelevant = 0;       // корректные Started/Finished
+    uint64_t duplicateStarts = 0;     // Started для уже открытого traceId (игнорируется)
+    uint64_t unmatchedFinishes = 0;   // Finished без открытого запроса (игнорируется)
+    uint64_t negativeDurations = 0;   // Finished раньше Started (запрос отбрасывается)
+    bool spilledToDisk = false;
+};
+
+// Разбирает строку в событие. Нерелевантные строки молча пропускаются, некорректные
+// учитываются в linesMalformed.
+std::optional<RequestEvent> parse_request_event(std::string_view line, IngestStats& stats) {
+    const auto parsed = split_log_line(line);
+    if (!parsed) { ++stats.linesMalformed; return std::nullopt; }
+    if (parsed->kind == EventKind::Irrelevant) return std::nullopt;
+
+    const auto timestampMillis = parse_iso8601_utc_millis(parsed->timestamp);
+    if (!timestampMillis || parsed->traceId.empty() ||
+        parsed->traceId.size() > Config::kMaxTraceIdLength) {
+        ++stats.linesMalformed;
+        return std::nullopt;
+    }
+
+    ++stats.linesRelevant;
+    return RequestEvent{parsed->traceId, *timestampMillis, parsed->kind == EventKind::Finished};
+}
+
+// ==========================================================================
+// Топ-K по длительности (онлайн, без сортировки всех завершённых запросов)
+// ==========================================================================
+
+struct DurationEntry {
+    std::string traceId;
+    int64_t durationMillis;
+};
+
+// Порядок результатов: больше длительность — выше; при равенстве — traceId по
+// возрастанию. Порядок не зависит от того, в каком режиме шла обработка.
+bool ranks_higher(int64_t durationA, std::string_view traceIdA,
+                  int64_t durationB, std::string_view traceIdB) noexcept {
+    if (durationA != durationB) return durationA > durationB;
+    return traceIdA < traceIdB;
+}
+
+class TopKDurations {
+public:
+    explicit TopKDurations(size_t capacity) : capacity_(capacity) { entries_.reserve(capacity_); }
+
+    void offer(std::string_view traceId, int64_t durationMillis) {
+        if (capacity_ == 0) return;
+
+        if (entries_.size() < capacity_) {
+            entries_.push_back({std::string(traceId), durationMillis});
+            return;
+        }
+
+        auto weakest = std::min_element(entries_.begin(), entries_.end(),
+            [](const DurationEntry& a, const DurationEntry& b) {
+                return ranks_higher(b.durationMillis, b.traceId, a.durationMillis, a.traceId);
+            });
+        if (ranks_higher(durationMillis, traceId, weakest->durationMillis, weakest->traceId)) {
+            *weakest = {std::string(traceId), durationMillis};
+        }
+    }
+
+    std::vector<DurationEntry> sorted_descending() const {
+        std::vector<DurationEntry> result = entries_;
+        std::sort(result.begin(), result.end(),
+            [](const DurationEntry& a, const DurationEntry& b) {
+                return ranks_higher(a.durationMillis, a.traceId, b.durationMillis, b.traceId);
+            });
+        return result;
     }
 
 private:
-    size_t unread_bytes() const noexcept { return dataEnd_ - readPosition_; }
-
-    std::optional<size_t> find_newline() const {
-        const void* found = std::memchr(buffer_.data() + readPosition_, '\n', unread_bytes());
-        if (!found) return std::nullopt;
-        return static_cast<size_t>(static_cast<const char*>(found) - buffer_.data());
-    }
-
-    std::string_view consume_up_to(size_t position, bool skipDelimiter) {
-        std::string_view line(buffer_.data() + readPosition_, position - readPosition_);
-        readPosition_ = position + (skipDelimiter ? 1 : 0);
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        return line;
-    }
-
-    bool refill() {
-        compact();
-        grow_if_needed();
-
-        ssize_t bytesRead;
-        do {
-            bytesRead = ::read(inputFd_, buffer_.data() + dataEnd_, buffer_.size() - dataEnd_);
-        } while (bytesRead < 0 && errno == EINTR);
-
-        if (bytesRead < 0) {
-            throw LogTopError(std::string("failed to read stdin: ") + std::strerror(errno), 2);
-        }
-        if (bytesRead == 0) return false; // настоящий конец потока, не ошибка
-        dataEnd_ += static_cast<size_t>(bytesRead);
-        return true;
-    }
-
-    void compact() {
-        if (readPosition_ == 0) return;
-        const size_t remaining = unread_bytes();
-        std::memmove(buffer_.data(), buffer_.data() + readPosition_, remaining);
-        readPosition_ = 0;
-        dataEnd_ = remaining;
-    }
-
-    void grow_if_needed() {
-        if (dataEnd_ < buffer_.size()) return;
-        const size_t grown = std::min(buffer_.size() * 2, maxLineBytes_);
-        if (grown > buffer_.size()) buffer_.resize(grown);
-        // Если расти уже некуда — next() обработает это веткой
-        // unread_bytes() >= maxLineBytes_ на следующей итерации.
-    }
-
-    int inputFd_;
-    size_t maxLineBytes_;
-    std::vector<char> buffer_;
-    size_t readPosition_ = 0;
-    size_t dataEnd_ = 0;
+    size_t capacity_;
+    std::vector<DurationEntry> entries_;
 };
 
 // ==========================================================================
-// Компактная бинарная запись во временных бакетах
+// Открытые запросы
 // ==========================================================================
 
-// Хранит только то, что нужно для вычисления длительности: ни MESSAGE, ни
-// исходный текст timestamp. Фиксированный размер записи делает проверку
-// "поместится ли бакет в бюджет памяти" точной (по размеру файла в
-// байтах), а не эвристической.
+struct TransparentStringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept { return std::hash<std::string_view>{}(sv); }
+};
+
+struct TransparentStringEqual {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
+};
+
+enum class ApplyResult { Applied, Full };
+
+// Хранит незавершённые запросы: traceId -> время начала. Используется и в обычном
+// потоке (с лимитом maxOpen), и при сведении бакетов (без лимита, потому что
+// лист ограничен maxBucketBytes).
+//
+// Правила (фиксируем явно, они совпадают для обоих режимов):
+//  - Started для открытого traceId — дубль: учитывается первый, остальные игнорируются.
+//  - Started для traceId, который уже завершён, — новый запрос.
+//  - Finished без открытого запроса — игнорируется (unmatchedFinishes).
+//  - Finished раньше Started — запрос закрывается без результата (negativeDurations).
+class RequestTracker {
+public:
+    explicit RequestTracker(size_t maxOpenRequests) : maxOpen_(maxOpenRequests) {}
+
+    // Full: новый запрос открыть нельзя — событие не учтено, вызывающий код
+    // переносит состояние на диск.
+    ApplyResult apply(const RequestEvent& event, TopKDurations& topK, IngestStats& stats) {
+        const auto it = open_.find(event.traceId);
+
+        if (!event.finished) {
+            if (it != open_.end()) {
+                ++stats.duplicateStarts;
+                return ApplyResult::Applied;
+            }
+            if (open_.size() >= maxOpen_) return ApplyResult::Full;
+            open_.emplace(std::string(event.traceId), event.timestampMillis);
+            return ApplyResult::Applied;
+        }
+
+        if (it == open_.end()) {
+            ++stats.unmatchedFinishes;
+            return ApplyResult::Applied;
+        }
+        const int64_t duration = event.timestampMillis - it->second;
+        open_.erase(it);
+        if (duration < 0) {
+            ++stats.negativeDurations;
+            return ApplyResult::Applied;
+        }
+        topK.offer(event.traceId, duration);
+        return ApplyResult::Applied;
+    }
+
+    template <class Visitor>
+    void for_each_open(Visitor&& visit) const {
+        for (const auto& [traceId, startMillis] : open_) {
+            visit(std::string_view(traceId), startMillis);
+        }
+    }
+
+    // Освобождает память таблицы (clear() сохранил бы бакеты).
+    void release() { open_ = decltype(open_){}; }
+
+private:
+    size_t maxOpen_;
+    std::unordered_map<std::string, int64_t, TransparentStringHash, TransparentStringEqual> open_;
+};
+
+// ==========================================================================
+// Временные бакеты (только при переполнении)
+// ==========================================================================
+
+// Запись фиксированного размера: без MESSAGE и без исходного текста timestamp.
 #pragma pack(push, 1)
 struct BucketRecord {
     int64_t timestampMillis;
@@ -357,31 +444,21 @@ static_assert(sizeof(BucketRecord) == 8 + 1 + 1 + Config::kMaxTraceIdLength,
 
 uint64_t fnv1a_hash(std::string_view data, uint64_t seed) noexcept {
     uint64_t hash = seed ^ 0xcbf29ce484222325ULL;
-    for (unsigned char byte : data) {
-        hash ^= byte;
+    for (const char c : data) {
+        hash ^= static_cast<unsigned char>(c);
         hash *= 0x100000001b3ULL;
     }
     return hash;
 }
 
-// Разные seed на разных уровнях рекурсии дробят случайный перекос хеша
-// между уровнями. Это не защита от целенаправленно подобранных
-// коллизий — см. пояснение в сопроводительном разборе после кода.
+// Разный seed на каждом уровне рекурсии дробит случайный перекос хеша. Это не
+// защита от целенаправленно подобранных коллизий.
 uint64_t hash_seed_for_depth(int depth) noexcept {
-    return 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(depth + 1);
+    return 0x9E3779B97F4A7C15ULL * (static_cast<uint64_t>(depth) + 1);
 }
 
-// ==========================================================================
-// Временная рабочая директория (RAII)
-// ==========================================================================
-
-// Создаётся в стандартном системном временном каталоге (учитывает TMPDIR,
-// как это принято на GNU/Linux — std::filesystem::temp_directory_path).
-// Удаляется целиком в деструкторе БЕЗ ПОЛАГАНИЯ на то, что вся обработка
-// уже подчистила за собой каждый файл: это защищает от утечки временных
-// файлов на любом аварийном пути (исключение размотает стек и вызовет
-// этот деструктор — в отличие от std::exit(), которым этот код
-// сознательно не пользуется).
+// Временный каталог создаётся только при переполнении. Удаляется целиком в
+// деструкторе, поэтому исключение (в т.ч. прерывание) не оставляет файлов.
 class TempWorkspace {
 public:
     TempWorkspace() : directory_(create_unique_directory()) {}
@@ -398,9 +475,6 @@ public:
     TempWorkspace(const TempWorkspace&) = delete;
     TempWorkspace& operator=(const TempWorkspace&) = delete;
 
-    // Путь для нового временного файла с гарантированно уникальным в
-    // пределах этого workspace именем. Счётчик — состояние объекта, не
-    // глобальная переменная.
     std::string make_unique_path(std::string_view label) {
         return (directory_ / (std::string(label) + std::to_string(nextFileId_++) + ".bin")).string();
     }
@@ -428,21 +502,17 @@ private:
     uint64_t nextFileId_ = 0;
 };
 
-// ==========================================================================
-// Набор буферизованных файлов-бакетов для записи
-// ==========================================================================
-
 class BucketFileSet {
 public:
-    BucketFileSet(TempWorkspace& workspace, size_t bucketCount, std::string_view label, size_t ioBufferBytes)
-        : bucketCount_(bucketCount) {
-        files_.reserve(bucketCount_);
-        paths_.reserve(bucketCount_);
-        for (size_t i = 0; i < bucketCount_; ++i) {
+    BucketFileSet(TempWorkspace& workspace, size_t bucketCount, std::string_view label, size_t ioBufferBytes) {
+        files_.reserve(bucketCount);
+        paths_.reserve(bucketCount);
+        for (size_t i = 0; i < bucketCount; ++i) {
             std::string path = workspace.make_unique_path(label);
             FILE* file = std::fopen(path.c_str(), "wb");
             if (!file) {
-                throw LogTopError("cannot create temp file " + path + ": " + std::strerror(errno), 2);
+                const int savedErrno = errno;
+                throw LogTopError("cannot create temp file " + path + ": " + std::strerror(savedErrno), 2);
             }
             std::setvbuf(file, nullptr, _IOFBF, ioBufferBytes);
             files_.push_back(file);
@@ -456,14 +526,14 @@ public:
     BucketFileSet& operator=(const BucketFileSet&) = delete;
 
     void write(size_t bucketIndex, const BucketRecord& record) {
-        if (std::fwrite(&record, sizeof(record), 1, files_[bucketIndex]) != 1) {
-            throw LogTopError("write failed for temp file " + paths_[bucketIndex] +
-                               " (disk full?): " + std::strerror(errno), 2);
+        if (std::fwrite(&record, sizeof(record), 1, files_.at(bucketIndex)) != 1) {
+            const int savedErrno = errno;
+            throw LogTopError("write failed for temp file " + paths_.at(bucketIndex) +
+                               " (disk full?): " + std::strerror(savedErrno), 2);
         }
     }
 
-    // Закрывает все файлы и возвращает их пути. Безопасно вызывать
-    // повторно (в т.ч. из деструктора) — уже закрытые файлы пропускаются.
+    // Безопасно вызывать повторно, в т.ч. из деструктора.
     std::vector<std::string> close_all() {
         for (auto& file : files_) {
             if (file) {
@@ -475,182 +545,27 @@ public:
     }
 
 private:
-    size_t bucketCount_;
     std::vector<FILE*> files_;
     std::vector<std::string> paths_;
 };
 
 // ==========================================================================
-// Индекс "ещё не завершённых" запросов внутри ОДНОГО бакета
-// ==========================================================================
-
-struct TransparentStringHash {
-    using is_transparent = void;
-    size_t operator()(std::string_view sv) const noexcept { return std::hash<std::string_view>{}(sv); }
-};
-
-struct TransparentStringEqual {
-    using is_transparent = void;
-    bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
-};
-
-// Размер этой структуры ограничен размером ОДНОГО бакета (см.
-// BucketReducer), а не общим числом traceId во входном файле — именно
-// это и делает пиковую память независимой от размера входа.
-class StartedRequestIndex {
-public:
-    // Запоминает время старта, если это первое "Started" для traceId.
-    // Повторные "Started" для того же traceId (дубль/аномалия входных
-    // данных) игнорируются — побеждает самый ранний, и лишняя строка не
-    // аллоцируется на дублях благодаря гетерогенному поиску по
-    // string_view перед вставкой.
-    void record_started(std::string_view traceId, int64_t startMillis) {
-        if (startTimes_.find(traceId) == startTimes_.end()) {
-            startTimes_.emplace(std::string(traceId), startMillis);
-        }
-    }
-
-    // Если для traceId был зарегистрирован старт — возвращает
-    // длительность и удаляет запись (защита от повторных
-    // Completed/Failed на тот же traceId). Если старта не было —
-    // завершение без начала считается аномалией и игнорируется.
-    // Отрицательная длительность (часы "назад") тоже считается
-    // аномалией.
-    std::optional<int64_t> record_finished(std::string_view traceId, int64_t finishMillis) {
-        auto it = startTimes_.find(traceId); // поиск по string_view, без аллокации
-        if (it == startTimes_.end()) return std::nullopt;
-
-        const int64_t duration = finishMillis - it->second;
-        startTimes_.erase(it);
-        if (duration < 0) return std::nullopt;
-        return duration;
-    }
-
-private:
-    std::unordered_map<std::string, int64_t, TransparentStringHash, TransparentStringEqual> startTimes_;
-};
-
-// ==========================================================================
-// Топ-K по длительности без сортировки всего множества запросов
-// ==========================================================================
-
-struct DurationEntry {
-    std::string traceId;
-    int64_t durationMillis;
-};
-
-// Фиксированного размера (K <= 5 по заданию): линейный поиск минимума
-// среди K элементов на каждой вставке дешевле и проще кучи при таком K.
-class TopKDurations {
-public:
-    explicit TopKDurations(size_t capacity) : capacity_(capacity) { entries_.reserve(capacity_); }
-
-    void offer(std::string_view traceId, int64_t durationMillis) {
-        if (capacity_ == 0) return;
-
-        if (entries_.size() < capacity_) {
-            entries_.push_back({std::string(traceId), durationMillis});
-            return;
-        }
-
-        auto weakest = std::min_element(entries_.begin(), entries_.end(),
-            [](const DurationEntry& a, const DurationEntry& b) { return a.durationMillis < b.durationMillis; });
-        if (durationMillis > weakest->durationMillis) {
-            *weakest = {std::string(traceId), durationMillis};
-        }
-    }
-
-    // Сортируется только сам результат (<= K элементов), не весь набор
-    // завершённых запросов.
-    std::vector<DurationEntry> sorted_descending() const {
-        std::vector<DurationEntry> result = entries_;
-        std::sort(result.begin(), result.end(),
-            [](const DurationEntry& a, const DurationEntry& b) { return a.durationMillis > b.durationMillis; });
-        return result;
-    }
-
-private:
-    size_t capacity_;
-    std::vector<DurationEntry> entries_;
-};
-
-// ==========================================================================
-// Фаза 1: потоковое партиционирование stdin по хешу traceId
-// ==========================================================================
-
-struct PartitionStats {
-    uint64_t linesRead = 0;
-    uint64_t linesMalformed = 0;
-    uint64_t linesRelevant = 0;
-};
-
-class PartitionPass {
-public:
-    PartitionPass(TempWorkspace& workspace, const Config& config)
-        : workspace_(workspace), config_(config) {}
-
-    // Один проход по входному дескриптору. Возвращает пути к бакетам
-    // первого уровня. Сама фаза не удерживает ничего, кроме буферов
-    // записи и буфера чтения — оба фиксированного размера, независимого
-    // от объёма входа.
-    std::vector<std::string> run(int inputFd, PartitionStats& stats) {
-        BucketFileSet buckets(workspace_, config_.bucketCount, "l0-", Config::kBucketIoBufferBytes);
-        LineReader reader(inputFd, Config::kReadBufferBytes, Config::kMaxLineBytes);
-
-        std::string_view line;
-        while (reader.next(line)) {
-            ++stats.linesRead;
-            process_line(line, buckets, stats);
-        }
-
-        return buckets.close_all();
-    }
-
-private:
-    void process_line(std::string_view line, BucketFileSet& buckets, PartitionStats& stats) {
-        const auto parsed = split_log_line(line);
-        if (!parsed) { ++stats.linesMalformed; return; }
-        if (parsed->kind == EventKind::Irrelevant) return;
-
-        const auto timestampMillis = parse_iso8601_utc_millis(parsed->timestamp);
-        if (!timestampMillis) { ++stats.linesMalformed; return; }
-
-        if (parsed->traceId.empty() || parsed->traceId.size() > Config::kMaxTraceIdLength) {
-            ++stats.linesMalformed;
-            return;
-        }
-
-        BucketRecord record{};
-        record.timestampMillis = *timestampMillis;
-        record.isFinishEvent = (parsed->kind == EventKind::Finished) ? 1 : 0;
-        record.traceIdLength = static_cast<uint8_t>(parsed->traceId.size());
-        std::memcpy(record.traceId, parsed->traceId.data(), parsed->traceId.size());
-
-        const uint64_t hash = fnv1a_hash(parsed->traceId, hash_seed_for_depth(0));
-        buckets.write(hash % config_.bucketCount, record);
-        ++stats.linesRelevant;
-    }
-
-    TempWorkspace& workspace_;
-    const Config& config_;
-};
-
-// ==========================================================================
-// Фаза 2: сведение бакетов (grace hash partitioning)
+// Сведение бакетов (grace hash partitioning)
 // ==========================================================================
 
 class BucketReducer {
 public:
-    BucketReducer(TempWorkspace& workspace, const Config& config, TopKDurations& topK)
-        : workspace_(workspace), config_(config), topK_(topK) {}
+    BucketReducer(TempWorkspace& workspace, const Config& config, TopKDurations& topK, IngestStats& stats)
+        : workspace_(workspace), config_(config), topK_(topK), stats_(stats) {}
 
-    // Обрабатывает один файл-бакет; при необходимости рекурсивно дробит
-    // его дальше. Файл всегда удаляется по завершении обработки — и в
-    // случае листа, и в случае дальнейшего дробления.
+    // Обрабатывает один файл-бакет, при необходимости рекурсивно дробит его.
+    // Файл удаляется по окончании обработки.
     void reduce(const std::string& bucketPath, int depth) {
+        throw_if_interrupted();
+
         std::error_code sizeError;
         const uintmax_t bucketBytes = fs::file_size(bucketPath, sizeError);
-        if (sizeError) return; // бакет пуст и не был создан на диске — нечего сводить
+        if (sizeError) return;
 
         if (bucketBytes > config_.maxBucketBytes) {
             reduce_oversized_bucket(bucketPath, bucketBytes, depth);
@@ -664,12 +579,6 @@ public:
 private:
     void reduce_oversized_bucket(const std::string& bucketPath, uintmax_t bucketBytes, int depth) {
         if (depth >= config_.maxRepartitionDepth) {
-            // Структурно недостижимо для входов 1-10 ГБ при разумном
-            // распределении хешей: на практике хватает 2-3 уровней (см.
-            // сопроводительный разбор). Если предел всё же достигнут —
-            // это сигнал аномалии (например, целенаправленно подобранные
-            // коллизии), и лучше упасть явно, чем молча нарушить лимит
-            // памяти загрузкой всего бакета целиком.
             throw LogTopError(
                 "bucket " + bucketPath + " (" + std::to_string(bucketBytes) +
                 " bytes) still exceeds " + std::to_string(config_.maxBucketBytes) +
@@ -687,38 +596,36 @@ private:
 
         FILE* input = std::fopen(bucketPath.c_str(), "rb");
         if (!input) {
-            throw LogTopError("cannot reopen " + bucketPath + " for repartitioning: " + std::strerror(errno), 2);
+            const int savedErrno = errno;
+            throw LogTopError("cannot reopen " + bucketPath + " for repartitioning: " + std::strerror(savedErrno), 2);
         }
 
         const uint64_t seed = hash_seed_for_depth(depth + 1);
         BucketRecord record;
         while (std::fread(&record, sizeof(record), 1, input) == 1) {
             const std::string_view traceId(record.traceId, record.traceIdLength);
-            const uint64_t hash = fnv1a_hash(traceId, seed);
-            subBuckets.write(hash % config_.repartitionFanout, record);
+            subBuckets.write(fnv1a_hash(traceId, seed) % config_.repartitionFanout, record);
         }
         std::fclose(input);
 
         return subBuckets.close_all();
     }
 
-    // Бакет заведомо мал (ограничен maxBucketBytes) -> размер индекса в
-    // памяти ограничен ЭТИМ бакетом, а не всем входным файлом.
+    // Лист ограничен maxBucketBytes, поэтому и трекер открытых запросов здесь
+    // ограничен размером листа.
     void reduce_leaf_bucket(const std::string& bucketPath) {
         FILE* input = std::fopen(bucketPath.c_str(), "rb");
         if (!input) {
-            throw LogTopError("cannot reopen " + bucketPath + ": " + std::strerror(errno), 2);
+            const int savedErrno = errno;
+            throw LogTopError("cannot reopen " + bucketPath + ": " + std::strerror(savedErrno), 2);
         }
 
-        StartedRequestIndex startedRequests;
+        RequestTracker tracker(SIZE_MAX);
         BucketRecord record;
         while (std::fread(&record, sizeof(record), 1, input) == 1) {
-            const std::string_view traceId(record.traceId, record.traceIdLength);
-            if (record.isFinishEvent == 0) {
-                startedRequests.record_started(traceId, record.timestampMillis);
-            } else if (const auto duration = startedRequests.record_finished(traceId, record.timestampMillis)) {
-                topK_.offer(traceId, *duration);
-            }
+            const RequestEvent event{std::string_view(record.traceId, record.traceIdLength),
+                                     record.timestampMillis, record.isFinishEvent != 0};
+            tracker.apply(event, topK_, stats_);
         }
         std::fclose(input);
     }
@@ -735,6 +642,94 @@ private:
     TempWorkspace& workspace_;
     const Config& config_;
     TopKDurations& topK_;
+    IngestStats& stats_;
+};
+
+// ==========================================================================
+// Основной поток: потоковый разбор и переход к бакетам при переполнении
+// ==========================================================================
+
+class LogAnalyzer {
+public:
+    explicit LogAnalyzer(const Config& config)
+        : config_(config), topK_(config.topK), tracker_(config.maxOpenRequests) {}
+
+    void consume_stdin() {
+        std::string line;
+        for (;;) {
+            const LineStatus status = read_stdin_line(line, Config::kMaxLineBytes);
+            if (status == LineStatus::EndOfInput) break;
+
+            ++stats_.linesRead;
+            if (status == LineStatus::TooLong) {
+                ++stats_.linesMalformed;
+                continue;
+            }
+            if (const auto event = parse_request_event(line, stats_)) {
+                handle_event(*event);
+            }
+        }
+
+        if (spilled_) finish_spilled_buckets();
+    }
+
+    std::vector<DurationEntry> top() const { return topK_.sorted_descending(); }
+    const IngestStats& stats() const { return stats_; }
+
+private:
+    void handle_event(const RequestEvent& event) {
+        if (!spilled_) {
+            if (tracker_.apply(event, topK_, stats_) == ApplyResult::Applied) return;
+            spill_open_requests();
+        }
+        write_to_bucket(event);
+    }
+
+    // Переносит открытые запросы на диск, освобождает таблицу. Дальнейшие
+    // события тоже идут в бакеты, потому что продолжение их пары находится там.
+    void spill_open_requests() {
+        workspace_.emplace();
+        buckets_.emplace(*workspace_, config_.bucketCount, "l0-", Config::kBucketIoBufferBytes);
+
+        tracker_.for_each_open([this](std::string_view traceId, int64_t startMillis) {
+            write_to_bucket(RequestEvent{traceId, startMillis, /*finished=*/false});
+        });
+        tracker_.release();
+
+        spilled_ = true;
+        stats_.spilledToDisk = true;
+    }
+
+    // Вызывается только при spilled_ == true, когда buckets_ уже создан: горячий
+    // путь, поэтому доступ через -> без проверки optional.
+    void write_to_bucket(const RequestEvent& event) {
+        BucketRecord record{};
+        record.timestampMillis = event.timestampMillis;
+        record.isFinishEvent = event.finished ? 1 : 0;
+        record.traceIdLength = static_cast<uint8_t>(event.traceId.size());
+        std::memcpy(record.traceId, event.traceId.data(), event.traceId.size());
+
+        buckets_->write(fnv1a_hash(event.traceId, hash_seed_for_depth(0)) % config_.bucketCount, record);
+    }
+
+    void finish_spilled_buckets() {
+        const std::vector<std::string> levelZero = buckets_.value().close_all();
+        buckets_.reset();
+
+        BucketReducer reducer(workspace_.value(), config_, topK_, stats_);
+        for (const auto& bucketPath : levelZero) {
+            reducer.reduce(bucketPath, /*depth=*/0);
+        }
+    }
+
+    const Config& config_;
+    TopKDurations topK_;
+    RequestTracker tracker_;
+    IngestStats stats_;
+    bool spilled_ = false;
+    // Порядок важен: buckets_ уничтожается раньше workspace_ (сначала закрыть файлы).
+    std::optional<TempWorkspace> workspace_;
+    std::optional<BucketFileSet> buckets_;
 };
 
 // ==========================================================================
@@ -742,7 +737,7 @@ private:
 // ==========================================================================
 
 void apply_command_line_arguments(int argc, char** argv, Config& config) {
-    auto readSizeArgument = [](std::string_view arg, std::string_view flag) -> std::optional<long long> {
+    auto readNumber = [](std::string_view arg, std::string_view flag) -> std::optional<long long> {
         if (arg.size() <= flag.size() || arg.substr(0, flag.size()) != flag) return std::nullopt;
         const std::string_view digits = arg.substr(flag.size());
         long long value = 0;
@@ -753,10 +748,12 @@ void apply_command_line_arguments(int argc, char** argv, Config& config) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
-        if (const auto v = readSizeArgument(arg, "--buckets=")) {
-            config.bucketCount = static_cast<size_t>(std::max<long long>(1, *v));
-        } else if (const auto v = readSizeArgument(arg, "--top=")) {
-            config.topK = static_cast<size_t>(std::max<long long>(0, *v));
+        if (const auto buckets = readNumber(arg, "--buckets=")) {
+            config.bucketCount = static_cast<size_t>(std::clamp<long long>(*buckets, 1, Config::kMaxBucketCountArg));
+        } else if (const auto top = readNumber(arg, "--top=")) {
+            config.topK = static_cast<size_t>(std::clamp<long long>(*top, 0, Config::kMaxTopKArg));
+        } else if (const auto open = readNumber(arg, "--max-open-requests=")) {
+            config.maxOpenRequests = static_cast<size_t>(std::clamp<long long>(*open, 1, Config::kMaxOpenRequestsArg));
         }
     }
 }
@@ -769,41 +766,33 @@ int run(int argc, char** argv) {
     Config config;
     apply_command_line_arguments(argc, argv, config);
 
-    TempWorkspace workspace;
-    PartitionStats stats;
-    TopKDurations topDurations(config.topK);
+    LogAnalyzer analyzer(config);
+    analyzer.consume_stdin();
 
-    std::vector<std::string> firstLevelBuckets;
-    {
-        PartitionPass partitionPass(workspace, config);
-        firstLevelBuckets = partitionPass.run(STDIN_FILENO, stats);
-    }
-
-    {
-        BucketReducer reducer(workspace, config, topDurations);
-        for (const auto& bucketPath : firstLevelBuckets) {
-            reducer.reduce(bucketPath, /*depth=*/0);
-        }
-    }
-
-    for (const auto& entry : topDurations.sorted_descending()) {
+    for (const auto& entry : analyzer.top()) {
         std::printf("%s %lld\n", entry.traceId.c_str(), static_cast<long long>(entry.durationMillis));
     }
 
-    std::fprintf(stderr, "logtop: lines read=%llu relevant=%llu malformed=%llu\n",
+    const IngestStats& stats = analyzer.stats();
+    std::fprintf(stderr,
+                 "logtop: lines read=%llu relevant=%llu malformed=%llu duplicate_starts=%llu "
+                 "unmatched_finishes=%llu negative_durations=%llu spilled=%d\n",
                  static_cast<unsigned long long>(stats.linesRead),
                  static_cast<unsigned long long>(stats.linesRelevant),
-                 static_cast<unsigned long long>(stats.linesMalformed));
-
+                 static_cast<unsigned long long>(stats.linesMalformed),
+                 static_cast<unsigned long long>(stats.duplicateStarts),
+                 static_cast<unsigned long long>(stats.unmatchedFinishes),
+                 static_cast<unsigned long long>(stats.negativeDurations),
+                 stats.spilledToDisk ? 1 : 0);
     return 0;
-    // TempWorkspace выходит из области видимости здесь и в любом месте,
-    // куда исключение размотает стек из этой функции — деструктор
-    // гарантированно подчищает временный каталог в обоих случаях.
 }
 
 } // namespace logtop
 
 int main(int argc, char** argv) {
+    std::signal(SIGINT, logtop::handle_termination_signal);
+    std::signal(SIGTERM, logtop::handle_termination_signal);
+
     try {
         return logtop::run(argc, argv);
     } catch (const logtop::LogTopError& error) {
