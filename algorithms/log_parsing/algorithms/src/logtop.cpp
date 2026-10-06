@@ -1,37 +1,16 @@
 #include "logtop.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <format>
-#include <functional>
-#include <queue>
 #include <sstream>
-#include <stdexcept>
-#include <unordered_map>
 
 namespace logtop {
 namespace {
 
-struct TransparentHash {
-    using is_transparent = void;
-    std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
-};
-
-// Порядок результатов: больше длительность — лучше; при равенстве меньше traceId — лучше.
-bool ranks_before(const RequestDuration& a, const RequestDuration& b) {
-    if (a.durationMs != b.durationMs) return a.durationMs > b.durationMs;
-    return a.traceId < b.traceId;
-}
-
-bool candidate_beats(std::int64_t durationMs, std::string_view traceId, const RequestDuration& other) {
-    if (durationMs != other.durationMs) return durationMs > other.durationMs;
-    return traceId < other.traceId;
-}
-
 struct Fields {
     std::string_view timestamp;
     std::string_view traceId;
-    std::string_view event;  // два слова: "Request started", "Request completed", ...
+    std::string_view event;
 };
 
 // <TIMESTAMP> <TRACE_ID> <EVENT из двух слов> [MESSAGE...]. MESSAGE не разбирается.
@@ -54,6 +33,13 @@ std::optional<Fields> split_fields(std::string_view line) {
                   line.substr(eventStart, eventEnd - eventStart)};
 }
 
+EventType event_type(std::string_view event) {
+    if (event == "Request started") return EventType::Started;
+    if (event == "Request completed") return EventType::Completed;
+    if (event == "Request failed") return EventType::Failed;
+    return EventType::Unknown;
+}
+
 }  // namespace
 
 std::optional<std::int64_t> parse_timestamp(std::string_view text) {
@@ -69,60 +55,59 @@ std::optional<std::int64_t> parse_timestamp(std::string_view text) {
     return time.time_since_epoch().count();
 }
 
-std::vector<RequestDuration> find_longest_requests(std::istream& in, std::size_t topCount) {
-    // traceId -> время начала открытого запроса.
-    std::unordered_map<std::string, std::int64_t, TransparentHash, std::equal_to<>> openRequests;
+std::optional<Record> parse_record(std::string_view line) {
+    // Файлы с окончаниями CRLF: \r относится к концу строки, а не к событию. Без этого
+    // завершение без MESSAGE ("Request completed\r") молча теряется.
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
 
-    // Верхний элемент — худший из лучших topCount, его вытесняет более длительный запрос.
-    auto worstOnTop = [](const RequestDuration& a, const RequestDuration& b) { return ranks_before(a, b); };
-    std::priority_queue<RequestDuration, std::vector<RequestDuration>, decltype(worstOnTop)> top(worstOnTop);
+    const auto fields = split_fields(line);
+    if (!fields || fields->traceId.empty()) return std::nullopt;  // traceId — непустой токен формата
 
-    std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+    const EventType type = event_type(fields->event);
+    if (type == EventType::Unknown) return std::nullopt;
 
-        const auto fields = split_fields(line);
-        if (!fields || fields->traceId.empty()) continue;
+    const auto timestampMs = parse_timestamp(fields->timestamp);
+    if (!timestampMs) return std::nullopt;
+    return Record{*timestampMs, fields->traceId, type};
+}
 
-        const bool started = fields->event == "Request started";
-        const bool finished = fields->event == "Request completed" || fields->event == "Request failed";
-        if (!started && !finished) continue;
+RequestTracker::RequestTracker(std::size_t topCount) : topCount_(topCount) {}
 
-        const auto timestampMs = parse_timestamp(fields->timestamp);
-        if (!timestampMs) continue;
-
-        if (started) {
+void RequestTracker::apply(const Record& record) {
+    switch (record.eventType) {
+        case EventType::Started:
             // Повторное начало открытого запроса — дубль; первый побеждает.
-            if (openRequests.find(fields->traceId) == openRequests.end()) {
-                openRequests.emplace(std::string(fields->traceId), *timestampMs);
+            if (openRequests_.find(record.traceId) == openRequests_.end()) {
+                openRequests_.emplace(std::string(record.traceId), record.timestampMs);
             }
-            continue;
+            break;
+        case EventType::Completed:
+        case EventType::Failed: {
+            // Завершение без открытого начала игнорируется; запрос удаляется в любом случае.
+            const auto it = openRequests_.find(record.traceId);
+            if (it == openRequests_.end()) break;
+            const std::int64_t durationMs = record.timestampMs - it->second;
+            openRequests_.erase(it);
+            if (durationMs < 0) break;
+
+            // При topCount == 0 элемент сразу вытесняется: top_ остаётся пустым.
+            top_.push({std::string(record.traceId), durationMs});
+            if (top_.size() > topCount_) top_.pop();
+            break;
         }
-
-        // Завершение без открытого начала игнорируется; запрос удаляется в любом случае.
-        const auto it = openRequests.find(fields->traceId);
-        if (it == openRequests.end()) continue;
-        const std::int64_t durationMs = *timestampMs - it->second;
-        openRequests.erase(it);
-        if (durationMs < 0 || topCount == 0) continue;
-
-        if (top.size() < topCount) {
-            top.push({std::string(fields->traceId), durationMs});
-        } else if (candidate_beats(durationMs, fields->traceId, top.top())) {
-            top.pop();
-            top.push({std::string(fields->traceId), durationMs});
-        }
+        case EventType::Unknown:
+            break;
     }
-    if (in.bad()) throw std::runtime_error("failed to read input");
+}
 
-    std::vector<RequestDuration> result;
-    result.reserve(top.size());
-    while (!top.empty()) {
-        result.push_back(top.top());
-        top.pop();
+std::vector<RequestDuration> RequestTracker::top() const {
+    // pop() отдаёт худший элемент первым; заполняем с конца, и лучший оказывается первым.
+    auto rest = top_;
+    std::vector<RequestDuration> result(rest.size());
+    for (std::size_t i = result.size(); i-- > 0;) {
+        result[i] = rest.top();
+        rest.pop();
     }
-    std::sort(result.begin(), result.end(),
-              [](const RequestDuration& a, const RequestDuration& b) { return ranks_before(a, b); });
     return result;
 }
 

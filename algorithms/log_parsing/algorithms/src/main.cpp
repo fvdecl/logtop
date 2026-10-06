@@ -1,17 +1,24 @@
 #include "logtop.hpp"
 
-#include <exception>
+#include <cstdio>
 #include <iostream>
+#include <string>
 
 int main() {
-    std::ios_base::sync_with_stdio(false);
-    try {
-        for (const auto& request : logtop::find_longest_requests(std::cin)) {
-            std::cout << request.traceId << ' ' << request.durationMs << '\n';
-        }
-    } catch (const std::exception& error) {
-        std::cerr << "logtop: " << error.what() << '\n';
+    constexpr std::size_t kTopCount = 5;
+    logtop::RequestTracker tracker(kTopCount);
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (const auto record = logtop::parse_record(line)) tracker.apply(*record);
+    }
+    if (std::ferror(stdin) != 0) {
+        std::cerr << "logtop: failed to read input\n";
         return 2;
+    }
+
+    for (const auto& request : tracker.top()) {
+        std::cout << request.traceId << ' ' << request.durationMs << '\n';
     }
     return 0;
 }
