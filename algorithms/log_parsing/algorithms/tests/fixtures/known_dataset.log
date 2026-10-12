@@ -1,0 +1,19 @@
+2025-11-18T12:34:56.789Z 7f3c2b Request started Received HTTP GET /api/items
+2025-11-18T12:34:58.012Z 7f3c2b DB query SELECT * FROM items WHERE id=1
+2025-11-18T12:34:59.123Z 7f3c2b Request completed 200 OK
+2025-11-18T12:35:00.000Z aaaaaa Request started GET /slow
+2025-11-18T12:35:10.500Z aaaaaa Request completed 200 OK
+2025-11-18T12:35:01.000Z bbbbbb Request started GET /never-completes
+2025-11-18T12:35:02.000Z cccccc Request started GET /fails
+2025-11-18T12:35:03.500Z cccccc Request failed 500 Internal Server Error
+
+this is not a valid log line at all
+2025-11-18T12:35:04.000Z
+2025-11-18T12:35:05.000Z dddddd Request started X
+2025-11-18T12:35:05.000Z dddddd Request started DUPLICATE-should-be-ignored
+2025-11-18T12:35:20.000Z dddddd Request completed X
+2025-11-18T12:35:30.000Z eeeeee Request completed no-matching-start
+2025-11-18T12:36:00.000ZBROKEN ffffff Request started broken timestamp
+ 
+2025-11-18T12:37:00.000Z gggggg Request started ok
+2025-11-18T12:36:59.000Z gggggg Request completed negative-duration-should-be-skipped
