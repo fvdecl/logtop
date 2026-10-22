@@ -1,0 +1,2 @@
+/usr/bin/ar qc liblogtop_core.a CMakeFiles/logtop_core.dir/src/logtop.cpp.o
+/usr/bin/ranlib liblogtop_core.a
