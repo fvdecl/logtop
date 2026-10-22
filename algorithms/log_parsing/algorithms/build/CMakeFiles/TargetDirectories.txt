@@ -1,7 +1,0 @@
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/logtop_core.dir
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/logtop.dir
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/logtop_parser_tests.dir
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/logtop_tracker_tests.dir
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/test.dir
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/edit_cache.dir
-/src/algorithms/log_parsing/algorithms/build/CMakeFiles/rebuild_cache.dir

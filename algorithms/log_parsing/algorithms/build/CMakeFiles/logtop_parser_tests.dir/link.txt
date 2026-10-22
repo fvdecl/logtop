@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/logtop_parser_tests.dir/link.d CMakeFiles/logtop_parser_tests.dir/tests/parser_tests.cpp.o -o logtop_parser_tests  liblogtop_core.a
