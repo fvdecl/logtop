@@ -9,3 +9,4 @@ find_package(Threads REQUIRED)
 
 enable_testing()
 add_subdirectory(thread_pool)
+add_subdirectory(scheduler)
